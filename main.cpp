@@ -5,6 +5,10 @@
 #include <random>
 #include <algorithm>
 #include <array>
+#include <filesystem>
+#include <regex>
+#include <iostream>
+#include <sstream>
 
 // array hasher
 namespace std
@@ -165,8 +169,6 @@ void fprintf(FILE* file, const Observations& observations)
     }
 }
 
-MarkovChain<std::string, 2> g_markovChain;
-
 bool IsAlphaNumeric(char c)
 {
     if (c >= 'a' && c <= 'z')
@@ -242,44 +244,80 @@ bool GetWord(unsigned char* contents, size_t size, size_t& position, std::string
     return true;
 }
 
-bool ProcessFile(const char* fileName)
+// Clean text content (remove YAML frontmatter and HTML tags)
+std::string CleanText(const std::string& rawText)
+{
+    std::string text = rawText;
+
+    // 1. Remove YAML Frontmatter (lines between --- at the start)
+    // Regex: Start of string, ---, anything non-greedy, ---
+    static const std::regex frontmatterRegex(R"(^---\s*[\r\n]+[\s\S]*?[\r\n]+---\s*)");
+    text = std::regex_replace(text, frontmatterRegex, "");
+
+    // 2. Remove HTML tags
+    // Regex: < followed by any character that is not >, followed by >
+    static const std::regex htmlTagRegex(R"(<[^>]*>)");
+    text = std::regex_replace(text, htmlTagRegex, " ");
+
+    return text;
+}
+
+template <size_t ORDER_N>
+bool ProcessFile(const std::string& fileName, MarkovChain<std::string, ORDER_N>& markovChain)
 {
     // read the file into memory
-    FILE* file = nullptr;
-    fopen_s(&file, fileName, "rt");
+    FILE* file = fopen(fileName.c_str(), "rt");
     if (!file)
         return false;
-    std::vector<unsigned char> contents;
+    
+    std::vector<char> rawContents;
     fseek(file, 0, SEEK_END);
-    contents.resize(ftell(file));
-    fseek(file, 0, SEEK_SET);
-    fread(contents.data(), 1, contents.size(), file);
+    long fileSize = ftell(file);
+    if (fileSize > 0)
+    {
+        rawContents.resize(fileSize);
+        fseek(file, 0, SEEK_SET);
+        fread(rawContents.data(), 1, fileSize, file);
+    }
     fclose(file);
 
+    if (rawContents.empty()) return true;
+
+    // Convert to string for regex processing
+    std::string contentStr(rawContents.begin(), rawContents.end());
+
+    // Clean the text
+    std::string cleanedContent = CleanText(contentStr);
+
+    // Copy back to a buffer we can iterate over easily for GetWord
+    // (GetWord expects unsigned char*, strictly speaking, but char* is fine for cast)
+    std::vector<unsigned char> contents(cleanedContent.begin(), cleanedContent.end());
+
     // get an observation context
-    auto context = g_markovChain.GetObservationContext();
+    auto context = markovChain.GetObservationContext();
 
     // process the file
     size_t position = 0;
     size_t size = contents.size();
     std::string nextWord;
     while(GetWord(contents.data(), size, position, nextWord))
-        g_markovChain.RecordObservation(context, nextWord);
+        markovChain.RecordObservation(context, nextWord);
 
     return true;
 }
 
-bool GenerateStatsFile(const char* fileName)
+template <typename MARKOVCHAIN>
+bool GenerateStatsFileTemplated(const char* fileName, MARKOVCHAIN& markovChain)
 {
-    FILE* file = nullptr;
-    fopen_s(&file, fileName, "w+t");
+    FILE* file = fopen(fileName, "w+t");
     if (!file)
         return false;
 
     // show the data we have
     fprintf(file, "\n\nWord Counts:");
-    for (auto& wordCounts : g_markovChain.m_counts)
+    for (auto& wordCounts : markovChain.m_counts)
     {
+        // fprintf for Observations is defined earlier
         fprintf(file, "\n[+] ");
         fprintf(file, wordCounts.first);
         fprintf(file, "\n");
@@ -289,7 +327,7 @@ bool GenerateStatsFile(const char* fileName)
     }
 
     fprintf(file, "\n\nWord Probabilities:");
-    for (auto& wordCounts : g_markovChain.m_probabilities)
+    for (auto& wordCounts : markovChain.m_probabilities)
     {
         fprintf(file, "\n[-] ");
         fprintf(file, wordCounts.first);
@@ -302,32 +340,22 @@ bool GenerateStatsFile(const char* fileName)
             lastProbability = wordCount.cumulativeProbability;
         }
     }
-
-    // show the ignored letters
-    fprintf(file, "\n\nIgnored Letters:\n");
-    for (int i = 1; i < 256; ++i)
-    {
-        if (IsAlphaNumeric(char(i)) || IsPunctuation(char(i)))
-            continue;
-
-        fprintf(file, "%c (%i)\n", char(i), i);
-    }
-
+    
+    fclose(file);
     return true;
 }
 
 template <typename MARKOVCHAIN>
 bool GenerateFile(const char* fileName, size_t wordCount, MARKOVCHAIN& markovChain)
 {
-    FILE* file = nullptr;
-    fopen_s(&file, fileName, "w+t");
+    FILE* file = fopen(fileName, "w+t");
     if (!file)
         return false;
 
     // get the initial starting state
     auto observations = markovChain.GetInitialObservations();
     std::string word = observations[0];
-    word[0] = toupper(word[0]);
+    if (!word.empty()) word[0] = toupper(word[0]);
     fprintf(file, "%s", word.c_str());
 
     bool capitalizeFirstLetter = false;
@@ -337,7 +365,7 @@ bool GenerateFile(const char* fileName, size_t wordCount, MARKOVCHAIN& markovCha
         markovChain.GetNextObservations(observations);
 
         std::string nextWord = observations[0];
-        if (capitalizeFirstLetter)
+        if (capitalizeFirstLetter && !nextWord.empty())
         {
             nextWord[0] = toupper(nextWord[0]);
             capitalizeFirstLetter = false;
@@ -356,46 +384,103 @@ bool GenerateFile(const char* fileName, size_t wordCount, MARKOVCHAIN& markovCha
     return true;
 }
 
-int main(int argc, char** argv)
+// Specialization or overload for RunEngine to call the templated stats
+template <size_t ORDER_N>
+int RunEngineWithStats(const std::vector<std::string>& inputFiles, int wordCount)
 {
-    std::vector<const char*> inputFiles =
-    {
-        //"data/projbluenoise.txt",
-        //"data/psychreport.txt",
-        "data/lastquestion.txt",
-        "data/telltale.txt",
-    };
+    MarkovChain<std::string, ORDER_N> markovChain;
 
-    // process input
-    for (const char* inputFile : inputFiles)
+    for (const auto& inputFile : inputFiles)
     {
-        printf("processing %s...\n", inputFile);
-        if (!ProcessFile(inputFile))
+        printf("processing %s...\n", inputFile.c_str());
+        if (!ProcessFile(inputFile, markovChain))
         {
-            printf("could not open file %s!\n", inputFile);
-            return 1;
+            printf("could not open file %s!\n", inputFile.c_str());
         }
     }
 
-    // make probabilities
-    printf("Calculating probabilities...\n");
-    g_markovChain.FinalizeLearning();
+    printf("Calculating probabilities (Order %zu)...\n", ORDER_N);
+    markovChain.FinalizeLearning();
 
-    // make statistics file
-    if (!GenerateStatsFile("out/stats.txt"))
+    if (!GenerateStatsFileTemplated("out/stats.txt", markovChain))
     {
         printf("Could not generate stats file!\n");
-        return 1;
     }
 
-    // make output
-    if (!GenerateFile("out/generated.txt", 1000, g_markovChain))
+    if (!GenerateFile("out/generated.txt", wordCount, markovChain))
     {
         printf("Could not generate output file!\n");
         return 1;
     }
 
+    printf("Done. Output in out/generated.txt\n");
     return 0;
+}
+
+void PrintUsage()
+{
+    printf("Usage: textgen [-o order] [-l length]\n");
+    printf("  -o order   : Markov chain order (1-5). Default 2.\n");
+    printf("  -l length  : Number of words to generate. Default 1000.\n");
+}
+
+int main(int argc, char** argv)
+{
+    // Default parameters
+    int order = 2;
+    int wordCount = 1000;
+
+    // Simple arg parsing
+    for (int i = 1; i < argc; ++i)
+    {
+        std::string arg = argv[i];
+        if (arg == "-o" && i + 1 < argc)
+        {
+            order = std::atoi(argv[++i]);
+        }
+        else if (arg == "-l" && i + 1 < argc)
+        {
+            wordCount = std::atoi(argv[++i]);
+        }
+        else
+        {
+            PrintUsage();
+            return 1;
+        }
+    }
+
+    // Find files
+    std::vector<std::string> inputFiles;
+    if (std::filesystem::exists("data"))
+    {
+        for (const auto& entry : std::filesystem::directory_iterator("data"))
+        {
+            std::string ext = entry.path().extension().string();
+            if (ext == ".txt" || ext == ".md")
+            {
+                inputFiles.push_back(entry.path().string());
+            }
+        }
+    }
+    
+    if (inputFiles.empty())
+    {
+        printf("No .txt or .md files found in data/ directory.\n");
+        return 1;
+    }
+
+    // Run appropriate engine
+    switch (order)
+    {
+    case 1: return RunEngineWithStats<1>(inputFiles, wordCount);
+    case 2: return RunEngineWithStats<2>(inputFiles, wordCount);
+    case 3: return RunEngineWithStats<3>(inputFiles, wordCount);
+    case 4: return RunEngineWithStats<4>(inputFiles, wordCount);
+    case 5: return RunEngineWithStats<5>(inputFiles, wordCount);
+    default:
+        printf("Invalid order %d. Supported orders: 1-5.\n", order);
+        return 1;
+    }
 }
 
 /*
